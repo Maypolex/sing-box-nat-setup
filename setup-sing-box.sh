@@ -92,8 +92,8 @@ echo ">> 同步系统时间 (Reality 对系统时间较敏感)..."
 ntpd -q -p pool.ntp.org 2>/dev/null || echo "   时间同步失败，继续执行；如后续握手异常请手动同步时间。"
 
 DL_URL="https://github.com/SagerNet/sing-box/releases/download/v${VERSION}/sing-box-${VERSION}-linux-${SB_ARCH}-musl.tar.gz"
-TARBALL="/tmp/sing-box-${VERSION}-${SB_ARCH}.tar.gz"
-EXTRACT_DIR="/tmp/sing-box-extract-$$"
+TARBALL="/root/sing-box-${VERSION}-${SB_ARCH}.tar.gz"
+EXTRACT_DIR="/root/sing-box-extract-$$"
 
 echo ">> 下载 sing-box v${VERSION} (${SB_ARCH})..."
 rm -f "$TARBALL"
@@ -235,7 +235,7 @@ else
 fi
 
 echo ">> 清理临时文件..."
-rm -rf /tmp/sing-box-*
+rm -rf /root/sing-box-*
 cd ~
 rm -rf sing-box-*
 rm -rf /var/cache/apk/*
