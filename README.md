@@ -25,7 +25,7 @@ Alpine Linux (NAT VPS) 一键部署 **VLESS + Reality** (基于 [sing-box](https
 下载脚本并执行：
 
 ```bash
-wget -O setup-sing-box.sh https://raw.githubusercontent.com/你的用户名/sing-box-nat-setup/main/setup-sing-box.sh
+wget -O setup-sing-box.sh https://raw.githubusercontent.com/Maypolex/sing-box-nat-setup/main/setup-sing-box.sh
 chmod +x setup-sing-box.sh
 ./setup-sing-box.sh -p 40001
 ```
@@ -33,7 +33,7 @@ chmod +x setup-sing-box.sh
 或者一行流直接跑（`-s --` 是让参数正确传给脚本本身，不能省略）：
 
 ```bash
-wget -qO- https://raw.githubusercontent.com/你的用户名/sing-box-nat-setup/main/setup-sing-box.sh | sh -s -- -p 40001
+wget -qO- https://raw.githubusercontent.com/Maypolex/sing-box-nat-setup/main/setup-sing-box.sh | sh -s -- -p 40001
 ```
 
 ## 参数说明
