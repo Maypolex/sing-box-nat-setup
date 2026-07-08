@@ -1,264 +1,100 @@
 #!/bin/sh
 # ============================================================================
 # setup-sing-box.sh
-# Alpine Linux (NAT VPS) 一键部署 VLESS + Reality (sing-box)
-#
-# 用法:
-#   sh setup-sing-box.sh -p <端口> [-n 4|6|dual] [-s <SNI域名>] [-v <版本号>]
+# Alpine Linux one-shot installer for sing-box VLESS + Reality.
 # ============================================================================
 set -eu
 
 PORT=""
+EXT_PORT=""
 IP_MODE="dual"
 SNI="images.apple.com"
-VERSION="1.13.14"
+VERSION="latest"
+DNS_OPT=""
+CUSTOM_HOST=""
+ALLOW_PROXY=0
+EXPECTED_SHA256=""
+
 CONFIG_DIR="/etc/sing-box"
 BIN_PATH="/usr/local/bin/sing-box"
+SERVICE_PATH="/etc/init.d/sing-box"
+ERROR_LOG="/var/log/sing-box-error.log"
+FALLBACK_VERSION="1.13.14"
 
-usage() {
-  cat <<USAGE
-用法: $0 -p <端口> [-n 4|6|dual] [-s <SNI域名>] [-v <版本号>]
+TARBALL=""
+EXTRACT_DIR=""
+API_JSON=""
+TEMP_CONF=""
+NEW_BIN=""
+BACKUP_SUFFIX=""
+BIN_BAK=""
+CONFIG_BAK=""
+INIT_BAK=""
+SERVICE_WAS_RUNNING=0
 
-  -p  内部监听端口 (必填，NAT VPS 请填面板里映射的内部端口)
-  -n  监听模式: 4=仅IPv4  6=仅IPv6  dual=双栈监听 (默认: dual)
-  -s  Reality 使用的 SNI 伪装域名 (默认: images.apple.com)
-  -v  sing-box 版本号，不带 v 前缀 (默认: ${VERSION})
-  -h  显示本帮助
-USAGE
+die() {
+  echo "ERROR: $*" >&2
   exit 1
 }
 
-while getopts "p:n:s:v:h" opt; do
+warn() {
+  echo "WARN: $*" >&2
+}
+
+usage() {
+  exit_code="${1:-1}"
+  cat <<USAGE
+Usage: $0 -p <internal-port> [options]
+
+Required:
+  -p  Internal listening port from your NAT VPS provider panel.
+
+Options:
+  -e  External mapped port for the client link. Defaults to -p.
+  -H  Client connection host, IP, or domain. Recommended for NAT VPS.
+  -i  IP listen mode: 4, 6, or dual. Default: dual.
+  -s  Reality SNI camouflage domain. Default: images.apple.com.
+  -d  Custom DNS server IP. Domain names are intentionally rejected.
+  -v  sing-box version without leading v. Default: latest.
+  -S  Expected SHA256 of the release tarball.
+  -P  Allow third-party GitHub proxy download, only with SHA256 verification.
+  -h  Show this help.
+USAGE
+  exit "$exit_code"
+}
+
+cleanup() {
+  [ -n "$TARBALL" ] && rm -f "$TARBALL"
+  [ -n "$API_JSON" ] && rm -f "$API_JSON"
+  [ -n "$TEMP_CONF" ] && rm -f "$TEMP_CONF"
+  [ -n "$NEW_BIN" ] && rm -f "$NEW_BIN"
+  [ -n "$EXTRACT_DIR" ] && rm -rf "$EXTRACT_DIR"
+}
+
+trap cleanup EXIT INT TERM
+
+while getopts "p:e:H:i:s:v:d:S:hP" opt; do
   case "$opt" in
     p) PORT="$OPTARG" ;;
-    n) IP_MODE="$OPTARG" ;;
+    e) EXT_PORT="$OPTARG" ;;
+    H) CUSTOM_HOST="$OPTARG" ;;
+    i) IP_MODE="$OPTARG" ;;
     s) SNI="$OPTARG" ;;
     v) VERSION="$OPTARG" ;;
-    h) usage ;;
-    *) usage ;;
+    d) DNS_OPT="$OPTARG" ;;
+    S) EXPECTED_SHA256="$OPTARG" ;;
+    P) ALLOW_PROXY=1 ;;
+    h) usage 0 ;;
+    *) usage 1 ;;
   esac
 done
 
-[ -n "$PORT" ] || { echo "错误: 必须使用 -p 指定端口"; usage; }
-
-case "$PORT" in
-  ''|*[!0-9]*) echo "错误: 端口必须为数字"; exit 1 ;;
-esac
-if [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
-  echo "错误: 端口范围必须在 1-65535 之间"
-  exit 1
-fi
-
-case "$IP_MODE" in
-  4)
-    LISTEN_ADDR="0.0.0.0"
-    STRATEGY="ipv4_only"
-    ;;
-  6)
-    LISTEN_ADDR="::"
-    STRATEGY="ipv6_only"
-    ;;
-  dual)
-    LISTEN_ADDR="::"
-    STRATEGY="prefer_ipv6"
-    ;;
-  *) echo "错误: -n 参数只能是 4 / 6 / dual"; exit 1 ;;
-esac
-
-if [ "$(id -u)" -ne 0 ]; then
-  echo "错误: 请使用 root 权限运行此脚本"
-  exit 1
-fi
-
-BINDV6ONLY=$(sysctl -n net.ipv6.bindv6only 2>/dev/null || echo "0")
-if [ "$IP_MODE" = "dual" ] && [ "$BINDV6ONLY" = "1" ]; then
-  echo "警告: 检测到 net.ipv6.bindv6only=1，双栈监听可能失效，届时只有 IPv6 客户端能连接。"
-elif [ "$IP_MODE" = "6" ] && [ "$BINDV6ONLY" = "0" ]; then
-  echo "警告: 检测到 net.ipv6.bindv6only=0，监听 :: 会同时接受 IPv4 连接，'仅 IPv6' 模式未能严格隔离 IPv4。"
-fi
-
-ARCH=$(uname -m)
-case "$ARCH" in
-  x86_64)  SB_ARCH="amd64" ;;
-  aarch64) SB_ARCH="arm64" ;;
-  armv7l)  SB_ARCH="armv7" ;;
-  *) echo "错误: 不支持的架构 $ARCH"; exit 1 ;;
-esac
-
-echo ">> 安装依赖..."
-apk update && apk add wget tar ca-certificates openrc
-
-echo ">> 同步系统时间 (Reality 对系统时间较敏感)..."
-ntpd -q -p pool.ntp.org 2>/dev/null || echo "   时间同步失败，继续执行；如后续握手异常请手动同步时间。"
-
-DL_URL="https://github.com/SagerNet/sing-box/releases/download/v${VERSION}/sing-box-${VERSION}-linux-${SB_ARCH}-musl.tar.gz"
-TARBALL="/root/sing-box-${VERSION}-${SB_ARCH}.tar.gz"
-EXTRACT_DIR="/root/sing-box-extract-$$"
-
-echo ">> 下载 sing-box v${VERSION} (${SB_ARCH})..."
-rm -f "$TARBALL"
-i=0
-until wget -q -O "$TARBALL" "$DL_URL"; do
-  i=$((i + 1))
-  if [ "$i" -ge 3 ]; then
-    echo "错误: 下载失败，请检查网络，或确认版本号 v${VERSION} 是否存在"
-    exit 1
-  fi
-  echo "   下载失败，重试 ($i/3)..."
-  sleep 2
-done
-
-tar -tzf "$TARBALL" >/dev/null 2>&1 || { echo "错误: 下载的压缩包损坏或不完整"; exit 1; }
-
-mkdir -p "$EXTRACT_DIR"
-tar -zxf "$TARBALL" -C "$EXTRACT_DIR"
-SB_BIN=$(find "$EXTRACT_DIR" -type f -name sing-box | head -n1)
-
-[ -n "$SB_BIN" ] || { echo "错误: 未在压缩包中找到 sing-box 可执行文件"; exit 1; }
-
-if [ -f "$BIN_PATH" ] && rc-service sing-box status >/dev/null 2>&1; then
-  rc-service sing-box stop || true
-fi
-
-mv "$SB_BIN" "$BIN_PATH"
-chmod +x "$BIN_PATH"
-
-echo ">> 生成 UUID / Reality 密钥对 / Short ID..."
-UUID=$("$BIN_PATH" generate uuid)
-KEYPAIR=$("$BIN_PATH" generate reality-keypair)
-PRIVATE_KEY=$(echo "$KEYPAIR" | awk '/PrivateKey/ {print $2}')
-PUBLIC_KEY=$(echo "$KEYPAIR" | awk '/PublicKey/ {print $2}')
-SHORT_ID=$("$BIN_PATH" generate rand --hex 4)
-
-mkdir -p "$CONFIG_DIR"
-chmod 700 "$CONFIG_DIR"
-
-if [ -f "$CONFIG_DIR/config.json" ]; then
-  cp "$CONFIG_DIR/config.json" "$CONFIG_DIR/config.json.bak.$(date +%s)"
-fi
-
-cat > "$CONFIG_DIR/config.json" <<EOF
-{
-  "log": {
-    "level": "info",
-    "timestamp": true
-  },
-  "dns": {
-    "servers": [
-      {
-        "tag": "system-dns",
-        "type": "local"
-      }
-    ],
-    "strategy": "${STRATEGY}"
-  },
-  "inbounds": [
-    {
-      "type": "vless",
-      "tag": "vless-in",
-      "listen": "${LISTEN_ADDR}",
-      "listen_port": ${PORT},
-      "users": [
-        {
-          "uuid": "${UUID}",
-          "flow": "xtls-rprx-vision"
-        }
-      ],
-      "tls": {
-        "enabled": true,
-        "server_name": "${SNI}",
-        "reality": {
-          "enabled": true,
-          "handshake": {
-            "server": "${SNI}",
-            "server_port": 443
-          },
-          "private_key": "${PRIVATE_KEY}",
-          "short_id": [
-            "${SHORT_ID}"
-          ]
-        }
-      }
-    }
-  ],
-  "outbounds": [
-    {
-      "type": "direct",
-      "tag": "direct"
-    },
-    {
-      "type": "block",
-      "tag": "block"
-    }
-  ]
-}
-EOF
-chmod 600 "$CONFIG_DIR/config.json"
-
-echo ">> 校验配置文件..."
-"$BIN_PATH" check -c "$CONFIG_DIR/config.json"
-
-cat > /etc/init.d/sing-box <<'EOF'
-#!/sbin/openrc-run
-name="sing-box"
-description="sing-box daemon with auto-restart"
-command="/usr/local/bin/sing-box"
-command_args="run -c /etc/sing-box/config.json"
-supervisor="supervise-daemon"
-respawn_delay="1"
-respawn_max="5"
-respawn_period="60"
-output_log="/var/log/sing-box.log"
-error_log="/var/log/sing-box-error.log"
-
-depend() {
-    need net
-    after firewall
+is_uint_port() {
+  case "$1" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
 }
 
-start_pre() {
-    $command check -c /etc/sing-box/config.json
-    if [ $? -ne 0 ]; then
-        eerror "sing-box configuration check failed! Aborting start to prevent crash loop."
-        return 1
-    fi
-}
-EOF
-chmod +x /etc/init.d/sing-box
-
-rc-update add sing-box default 2>/dev/null || true
-
-if rc-service sing-box status >/dev/null 2>&1; then
-  rc-service sing-box restart
-else
-  rc-service sing-box start
-fi
-
-echo ">> 清理临时文件..."
-rm -rf /root/sing-box-*
-cd ~
-rm -rf sing-box-*
-rm -rf /var/cache/apk/*
-
-SERVER_IP=$(wget -qO- https://api.ipify.org 2>/dev/null || wget -qO- https://ifconfig.me 2>/dev/null || echo "自动获取失败-请手动填写")
-
-VLESS_LINK="vless://${UUID}@${SERVER_IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#sing-box-reality"
-
-cat > "$CONFIG_DIR/client-info.txt" <<EOF
-=== sing-box VLESS Reality 客户端信息 ===
-探测到的服务器IP: ${SERVER_IP}
-内部监听端口: ${PORT}
-监听模式: ${IP_MODE}
-UUID: ${UUID}
-Flow: xtls-rprx-vision
-SNI: ${SNI}
-PublicKey: ${PUBLIC_KEY}
-ShortId: ${SHORT_ID}
-
-订阅链接:
-${VLESS_LINK}
-EOF
-chmod 600 "$CONFIG_DIR/client-info.txt"
-
-echo "================= 部署完成 ================="
-cat "$CONFIG_DIR/client-info.txt"
+is_domain_name() {
+  printf '%s\n' "$1" | grep -Eq '^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$'
