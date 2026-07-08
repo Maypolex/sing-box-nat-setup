@@ -15,6 +15,9 @@ Alpine Linux NAT VPS 一键部署 **VLESS + Reality**，基于 [sing-box](https:
 - 默认解析 sing-box 最新版本，失败时回退到脚本内置版本
 - 优先使用 GitHub Release API 提供的 SHA256 摘要校验下载包
 - 可选 GitHub 代理下载，但必须有 SHA256 摘要保护
+- 低内存 NAT 优化：默认使用 `/root` 下的磁盘临时目录，避免 `/tmp` tmpfs 触发 OOM
+- 自动跳过 `tmpfs` / `ramfs` 临时目录，并检查安装临时目录可用空间
+- 安装期和 OpenRC 服务默认设置 Go 内存参数，降低小内存机器上的峰值压力
 - 部署前校验新配置，部署失败自动回滚旧二进制、旧配置和旧 OpenRC 服务
 - 启动后会再次确认 sing-box 仍在运行，避免“脚本成功但服务已退出”的假成功
 - 重复执行会备份旧配置并重启服务
@@ -27,8 +30,9 @@ Alpine Linux NAT VPS 一键部署 **VLESS + Reality**，基于 [sing-box](https:
 - **依赖工具**：`apk`、`wget`、`tar`、`ca-certificates`、`openssl`、`openrc`
 - **架构**：x86_64 / aarch64 / armv7l
 - **网络**：VPS 需要能访问 GitHub Release；如果不手动指定 `-H`，脚本还会访问 `api.ipify.org`、`api6.ipify.org` 或 `ifconfig.me` 来生成客户端链接里的 host
+- **磁盘空间**：默认要求安装临时目录至少约 180MB 可用空间
 
-已在 Alpine 3.23.5 IPv4 NAT 和 Alpine 3.19.1 IPv6 环境中验证部署、OpenRC 启动和 40001 端口连通性。
+已在 Alpine 3.23.5 IPv4 NAT、Alpine 3.19.1 IPv6、Alpine 3.24.1 100MB cgroup 内存限制环境中验证部署、OpenRC 启动和 40001 端口连通性。
 
 ## 快速开始
 
@@ -72,6 +76,13 @@ Options:
   -S  下载包的预期 SHA256
   -P  允许第三方 GitHub 代理下载；必须能取得 SHA256 摘要
   -h  显示帮助
+
+Environment:
+  INSTALL_TMP_PARENT  安装临时目录的父目录；默认 /root
+  MIN_TMP_FREE_KB     安装临时目录要求的可用空间；默认 180000
+  SING_BOX_GOMEMLIMIT sing-box 命令和服务的 Go 内存限制；默认 64MiB
+  SING_BOX_GOGC       sing-box 命令和服务的 Go GC 百分比；默认 50
+  ALLOW_TMPFS_TMP=1   允许回退到内存盘 /tmp；不推荐
 ```
 
 ## 示例
@@ -116,6 +127,18 @@ IPv6 地址可以不加方括号，脚本生成 `vless://` 链接时会自动加
 
 `-P` 只在直连 GitHub 下载失败时尝试代理，并且要求脚本能从 GitHub API 取得 SHA256 摘要，或你通过 `-S` 显式提供摘要。
 
+指定自定义磁盘临时目录：
+
+```bash
+INSTALL_TMP_PARENT=/root ./setup-sing-box.sh -p 40001
+```
+
+极小内存机器上可以进一步调低 Go 内存限制：
+
+```bash
+SING_BOX_GOMEMLIMIT=48MiB SING_BOX_GOGC=25 ./setup-sing-box.sh -p 40001
+```
+
 ## NAT VPS 端口映射
 
 `-p` 是 **VPS 内部监听端口**。这是 sing-box 在机器上实际绑定的端口。
@@ -141,6 +164,46 @@ IPv6 地址可以不加方括号，脚本生成 `vless://` 链接时会自动加
 - 探测失败时，客户端链接中的 host 会变成 `auto-detect-failed`
 
 NAT VPS、端口转发 VPS、使用域名连接、IPv6-only VPS 都建议显式指定 `-H`。
+
+## 低内存 NAT 说明
+
+很多 NAT 小鸡虽然 `free -m` 看起来有几百 MB 内存，但实际 cgroup 可能只给了几十到一百 MB。可以这样查看真实限制：
+
+```bash
+cat /sys/fs/cgroup/memory.max 2>/dev/null
+cat /sys/fs/cgroup/memory.events 2>/dev/null
+```
+
+在 Alpine 中，`/tmp` 经常是 `tmpfs`，也就是内存盘。sing-box release 压缩包约 20 多 MB，解压后的二进制约 60 多 MB。如果下载和解压都发生在 `/tmp`，这些文件会直接占用内存，极小内存 NAT 很容易触发 OOM，表现为 SSH 会话瞬间断开。
+
+因此脚本默认把安装临时目录放在：
+
+```text
+/root/sing-box-install.*
+```
+
+脚本还会：
+
+- 跳过挂载类型为 `tmpfs` / `ramfs` 的候选目录
+- 默认不回退到 `/tmp`
+- 要求临时目录至少有 `180000KB` 可用空间
+- 解压后立刻删除下载包
+- 使用 `mv` 安装 sing-box 二进制，减少额外文件复制峰值
+- 退出时通过 `trap` 自动清理临时目录
+
+如果你的系统 `/root` 空间不足，可以指定其他磁盘目录：
+
+```bash
+INSTALL_TMP_PARENT=/var/tmp ./setup-sing-box.sh -p 40001
+```
+
+只有非常确定 `/tmp` 不是内存瓶颈时，才建议允许回退到 `/tmp`：
+
+```bash
+ALLOW_TMPFS_TMP=1 ./setup-sing-box.sh -p 40001
+```
+
+不推荐在极小内存 NAT 上使用 `ALLOW_TMPFS_TMP=1`。
 
 ## 部署完成后
 
@@ -176,6 +239,7 @@ rc-service sing-box stop
 /usr/local/bin/sing-box check -c /etc/sing-box/config.json
 tail -f /var/log/sing-box-error.log
 cat /etc/sing-box/client-info.txt
+cat /sys/fs/cgroup/memory.events 2>/dev/null
 ```
 
 当前 OpenRC 服务把标准输出丢弃到 `/dev/null`，错误日志写入 `/var/log/sing-box-error.log`。
@@ -199,6 +263,7 @@ cat /etc/sing-box/client-info.txt
 - 旧 OpenRC 服务脚本会备份为 `/etc/init.d/sing-box.bak.<时间戳>`
 - 新配置校验失败时不会替换当前服务
 - 新服务启动失败或启动后退出时会自动回滚
+- 安装临时目录会在脚本退出时自动清理
 
 ## SNI 选择
 
