@@ -14,6 +14,9 @@ DNS_OPT=""
 CUSTOM_HOST=""
 ALLOW_PROXY=0
 EXPECTED_SHA256=""
+SING_BOX_GOMEMLIMIT="${SING_BOX_GOMEMLIMIT:-64MiB}"
+SING_BOX_GOGC="${SING_BOX_GOGC:-50}"
+MIN_TMP_FREE_KB="${MIN_TMP_FREE_KB:-180000}"
 
 CONFIG_DIR="/etc/sing-box"
 BIN_PATH="/usr/local/bin/sing-box"
@@ -21,6 +24,7 @@ SERVICE_PATH="/etc/init.d/sing-box"
 ERROR_LOG="/var/log/sing-box-error.log"
 FALLBACK_VERSION="1.13.14"
 
+INSTALL_TMP_DIR=""
 TARBALL=""
 EXTRACT_DIR=""
 API_JSON=""
@@ -59,16 +63,25 @@ Options:
   -S  Expected SHA256 of the release tarball.
   -P  Allow third-party GitHub proxy download, only with SHA256 verification.
   -h  Show this help.
+
+Environment:
+  INSTALL_TMP_PARENT  Disk-backed install temp parent. Default: /root.
+  MIN_TMP_FREE_KB     Required free space for install temp parent. Default: 180000.
+  SING_BOX_GOMEMLIMIT Go memory limit for sing-box commands/service. Default: 64MiB.
+  SING_BOX_GOGC       Go GC percentage for sing-box commands/service. Default: 50.
+  ALLOW_TMPFS_TMP=1   Allow /tmp fallback even when it is memory-backed. Not recommended.
 USAGE
   exit "$exit_code"
 }
 
 cleanup() {
+  [ -n "$INSTALL_TMP_DIR" ] && rm -rf "$INSTALL_TMP_DIR"
   [ -n "$TARBALL" ] && rm -f "$TARBALL"
   [ -n "$API_JSON" ] && rm -f "$API_JSON"
   [ -n "$TEMP_CONF" ] && rm -f "$TEMP_CONF"
   [ -n "$NEW_BIN" ] && rm -f "$NEW_BIN"
   [ -n "$EXTRACT_DIR" ] && rm -rf "$EXTRACT_DIR"
+  return 0
 }
 
 trap cleanup EXIT INT TERM
@@ -154,6 +167,79 @@ normalize_link_host() {
     *:*) printf '[%s]\n' "$host" ;;
     *) printf '%s\n' "$host" ;;
   esac
+}
+
+path_fs_type() {
+  target="$(cd "$1" 2>/dev/null && pwd -P)" || return 1
+  best_len=0
+  best_type=""
+
+  while read -r _dev mount type _rest; do
+    if [ "$mount" = "/" ]; then
+      matched=1
+    else
+      matched=0
+      case "$target" in
+        "$mount"|"$mount"/*) matched=1 ;;
+      esac
+    fi
+    if [ "$matched" = "1" ]; then
+      mount_len="${#mount}"
+      if [ "$mount_len" -ge "$best_len" ]; then
+        best_len="$mount_len"
+        best_type="$type"
+      fi
+    fi
+  done < /proc/mounts
+
+  [ -n "$best_type" ] || return 1
+  printf '%s\n' "$best_type"
+}
+
+is_memory_fs() {
+  fs_type="$(path_fs_type "$1" 2>/dev/null || echo unknown)"
+  case "$fs_type" in
+    tmpfs|ramfs) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+path_free_kb() {
+  df -Pk "$1" 2>/dev/null | awk 'NR == 2 { print $4 }'
+}
+
+create_install_tmp_dir() {
+  tmp_candidates="${INSTALL_TMP_PARENT:-/root} /var/tmp"
+  [ "${ALLOW_TMPFS_TMP:-0}" = "1" ] && tmp_candidates="$tmp_candidates /tmp"
+
+  for parent in $tmp_candidates; do
+    [ -n "$parent" ] || continue
+    [ -d "$parent" ] || mkdir -p "$parent" 2>/dev/null || continue
+    [ -w "$parent" ] || continue
+    if is_memory_fs "$parent"; then
+      warn "skipping $parent because it is mounted on memory-backed filesystem"
+      continue
+    fi
+
+    free_kb="$(path_free_kb "$parent" || echo 0)"
+    case "$free_kb" in
+      ''|*[!0-9]*) free_kb=0 ;;
+    esac
+    if [ "$free_kb" -lt "$MIN_TMP_FREE_KB" ]; then
+      warn "skipping $parent because free space is below ${MIN_TMP_FREE_KB}KB"
+      continue
+    fi
+
+    if INSTALL_TMP_DIR="$(mktemp -d "${parent%/}/sing-box-install.XXXXXX" 2>/dev/null)"; then
+      chmod 700 "$INSTALL_TMP_DIR"
+      return 0
+    fi
+  done
+  return 1
+}
+
+run_sing_box() {
+  GOMEMLIMIT="$SING_BOX_GOMEMLIMIT" GOGC="$SING_BOX_GOGC" "$@"
 }
 
 fetch_direct() {
@@ -329,9 +415,13 @@ else
   warn "$SNI may not support TLS 1.3, or the check timed out"
 fi
 
-TARBALL="$(mktemp)"
-EXTRACT_DIR="$(mktemp -d)"
-API_JSON="$(mktemp)"
+create_install_tmp_dir || die "failed to create a disk-backed install temp directory; set INSTALL_TMP_PARENT to a writable non-tmpfs path"
+echo ">> Using install temp directory: $INSTALL_TMP_DIR"
+TARBALL="${INSTALL_TMP_DIR}/sing-box.tar.gz"
+EXTRACT_DIR="${INSTALL_TMP_DIR}/extract"
+API_JSON="${INSTALL_TMP_DIR}/release.json"
+mkdir -p "$EXTRACT_DIR"
+: > "$API_JSON"
 
 if [ "$VERSION" = "latest" ]; then
   echo ">> Resolving latest sing-box version"
@@ -367,17 +457,19 @@ verify_sha256_if_available "$TARBALL"
 
 tar -tzf "$TARBALL" >/dev/null 2>&1 || die "tarball is corrupt or incomplete"
 tar -zxf "$TARBALL" -C "$EXTRACT_DIR"
+rm -f "$TARBALL"
+TARBALL=""
 
 SB_BIN="$(find "$EXTRACT_DIR" -type f -name sing-box | head -n 1 || true)"
 [ -n "$SB_BIN" ] || die "sing-box binary not found in tarball"
 chmod +x "$SB_BIN"
 
 echo ">> Generating credentials"
-UUID="$("$SB_BIN" generate uuid)"
-KEYPAIR="$("$SB_BIN" generate reality-keypair)"
+UUID="$(run_sing_box "$SB_BIN" generate uuid)"
+KEYPAIR="$(run_sing_box "$SB_BIN" generate reality-keypair)"
 PRIVATE_KEY="$(printf '%s\n' "$KEYPAIR" | awk '/PrivateKey/ {print $2}')"
 PUBLIC_KEY="$(printf '%s\n' "$KEYPAIR" | awk '/PublicKey/ {print $2}')"
-SHORT_ID="$("$SB_BIN" generate rand --hex 4)"
+SHORT_ID="$(run_sing_box "$SB_BIN" generate rand --hex 4)"
 
 [ -n "$UUID" ] || die "UUID generation failed"
 [ -n "$PRIVATE_KEY" ] || die "Reality private key generation failed"
@@ -448,13 +540,15 @@ EOF
 chmod 600 "$TEMP_CONF"
 
 echo ">> Validating new config with new binary"
-"$SB_BIN" check -c "$TEMP_CONF" >/dev/null || die "new config validation failed; current service was not touched"
+run_sing_box "$SB_BIN" check -c "$TEMP_CONF" >/dev/null || die "new config validation failed; current service was not touched"
 
 BIN_DIR="$(dirname "$BIN_PATH")"
 mkdir -p "$BIN_DIR"
 NEW_BIN="${BIN_DIR}/.sing-box.new.$$"
-cp "$SB_BIN" "$NEW_BIN"
+mv "$SB_BIN" "$NEW_BIN"
 chmod +x "$NEW_BIN"
+rm -rf "$EXTRACT_DIR"
+EXTRACT_DIR=""
 
 BACKUP_SUFFIX="$(date +%Y%m%d%H%M%S)"
 BIN_BAK="${BIN_PATH}.bak.${BACKUP_SUFFIX}"
@@ -488,6 +582,11 @@ respawn_max="5"
 respawn_period="60"
 output_log="/dev/null"
 error_log="/var/log/sing-box-error.log"
+
+: ${SING_BOX_GOMEMLIMIT:=64MiB}
+: ${SING_BOX_GOGC:=50}
+export GOMEMLIMIT="$SING_BOX_GOMEMLIMIT"
+export GOGC="$SING_BOX_GOGC"
 
 depend() {
     need net
